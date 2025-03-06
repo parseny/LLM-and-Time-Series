@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
-    BertModel, BertTokenizer
+    BertModel, BertTokenizer, AutoTokenizer, AutoModelForCausalLM
 from layers.Embed import PatchEmbedding
 import transformers
 from layers.StandardNorm import Normalize
@@ -36,7 +36,7 @@ class Model(nn.Module):
         self.seq_len = configs.seq_len
         self.d_ff = configs.d_ff
         self.top_k = 5
-        self.d_llm = configs.llm_dim
+        self.d_llm = 3072
         self.patch_len = configs.patch_len
         self.stride = configs.stride
 
@@ -77,6 +77,39 @@ class Model(nn.Module):
                 self.tokenizer = LlamaTokenizer.from_pretrained(
                     # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/tokenizer.model",
                     'huggyllama/llama-7b',
+                    trust_remote_code=True,
+                    local_files_only=False
+                )
+        elif configs.llm_model == 'LLAMA-3.2':
+            # self.llama_config = LlamaConfig.from_pretrained('/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/')
+            self.llama_config = LlamaConfig.from_pretrained("unsloth/Llama-3.2-3B")
+            self.llama_config.num_hidden_layers = configs.llm_layers
+            self.llama_config.output_attentions = True
+            self.llama_config.output_hidden_states = True
+            try:
+                self.llm_model = AutoModelForCausalLM.from_pretrained(
+                    pretrained_model_name_or_path="unsloth/Llama-3.2-3B",
+                    trust_remote_code=True,
+                    local_files_only=False,
+                    config=self.llama_config,
+                    # load_in_4bit=True
+                )
+            except EnvironmentError:  # downloads model from HF is not already done
+                print("Local model files not found. Attempting to download...")
+                self.llm_model = AutoModelForCausalLM.from_pretrained("unsloth/Llama-3.2-3B",
+                    trust_remote_code=True,
+                    local_files_only=False,
+                    config=self.llama_config,
+                    # load_in_4bit=True
+                )
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-3B",
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+            except EnvironmentError:  # downloads the tokenizer from HF if not already done
+                print("Local tokenizer files not found. Atempting to download them..")
+                self.tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-3B",
                     trust_remote_code=True,
                     local_files_only=False
                 )
@@ -174,6 +207,7 @@ class Model(nn.Module):
             configs.d_model, self.patch_len, self.stride, configs.dropout)
 
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
+        # print(f"word_embeddings {self.word_embeddings.shape}")
         self.vocab_size = self.word_embeddings.shape[0]
         self.num_tokens = 1000
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
@@ -240,7 +274,12 @@ class Model(nn.Module):
         enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
-        dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
+        outputs = self.llm_model(inputs_embeds=llama_enc_out, output_hidden_states=True)
+
+        # Access the last hidden state
+        dec_out = outputs.hidden_states[-1]
+
+        # Optionally, slice as needed
         dec_out = dec_out[:, :, :self.d_ff]
 
         dec_out = torch.reshape(
@@ -269,6 +308,13 @@ class ReprogrammingLayer(nn.Module):
         super(ReprogrammingLayer, self).__init__()
 
         d_keys = d_keys or (d_model // n_heads)
+        
+        # print(f"d_model {d_model}")
+        # print(f"n_heads {n_heads}")
+        # print(f"d_keys {d_keys}")
+        # print(f"d_llm {d_llm}")
+
+        d_llm = 3072
 
         self.query_projection = nn.Linear(d_model, d_keys * n_heads)
         self.key_projection = nn.Linear(d_llm, d_keys * n_heads)
@@ -282,10 +328,15 @@ class ReprogrammingLayer(nn.Module):
         S, _ = source_embedding.shape
         H = self.n_heads
 
+        # print("Input shape before key_projection:", source_embedding.shape)
+        # print("Key projection layer weight shape:", self.key_projection.weight.shape)
+
         target_embedding = self.query_projection(target_embedding).view(B, L, H, -1)
         source_embedding = self.key_projection(source_embedding).view(S, H, -1)
         value_embedding = self.value_projection(value_embedding).view(S, H, -1)
-
+        
+        # print("Shape after key_projection:", source_embedding.shape)
+        
         out = self.reprogramming(target_embedding, source_embedding, value_embedding)
 
         out = out.reshape(B, L, -1)

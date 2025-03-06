@@ -5,6 +5,7 @@ from accelerate import DistributedDataParallelKwargs
 from torch import nn, optim
 from torch.optim import lr_scheduler
 from tqdm import tqdm
+from matplotlib import pyplot as plt
 
 from models import Autoformer, DLinear, TimeLLM
 
@@ -13,9 +14,14 @@ import time
 import random
 import numpy as np
 import os
+import wandb
 
+WANDB_KEY = os.environ.get("WANDB_KEY") 
+
+wandb.login(key=WANDB_KEY)
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
 
@@ -77,7 +83,7 @@ parser.add_argument('--output_attention', action='store_true', help='whether to 
 parser.add_argument('--patch_len', type=int, default=16, help='patch length')
 parser.add_argument('--stride', type=int, default=8, help='stride')
 parser.add_argument('--prompt_domain', type=int, default=0, help='')
-parser.add_argument('--llm_model', type=str, default='LLAMA', help='LLM model') # LLAMA, GPT2, BERT
+parser.add_argument('--llm_model', type=str, default='LLAMA-3.2', help='LLM model') # LLAMA, GPT2, BERT
 parser.add_argument('--llm_dim', type=int, default='4096', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
 
 
@@ -97,11 +103,34 @@ parser.add_argument('--pct_start', type=float, default=0.2, help='pct_start')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
+# parser.add_argument("--gradient_clip_value", type=float, default=1.0, help="Value for gradient clipping")
+# parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for optimizer")
+
 
 args = parser.parse_args()
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
 accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
+
+wandb.init(project="time-llm", name=args.model_id, config=args)
+
+def plot_predictions_vs_true(true_values, predicted_values, epoch, output_path=None):
+    plt.figure(figsize=(16, 10))
+    plt.plot(true_values, label='True Values', color='hotpink', linewidth=0.5)
+    plt.plot(predicted_values, label='Predicted Values', color='mediumorchid', linewidth=0.5)
+
+    plt.title(f'Epoch {epoch + 1}: Predictions vs True Values')
+    plt.xlabel('Time')
+    plt.ylabel('Value')
+    plt.legend()
+
+    if output_path:
+        plt.savefig(output_path)  # Save to file if provided
+    else:
+        plt.show()
+
+    plt.close()
+
 
 for ii in range(args.itr):
     # setting record of experiments
@@ -169,15 +198,18 @@ for ii in range(args.itr):
 
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
-
+    
+    iterations = 0
     for epoch in range(args.train_epochs):
         iter_count = 0
+        
         train_loss = []
 
         model.train()
         epoch_time = time.time()
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader)):
             iter_count += 1
+            iterations += 1
             model_optim.zero_grad()
 
             batch_x = batch_x.float().to(accelerator.device)
@@ -224,6 +256,10 @@ for ii in range(args.itr):
                 accelerator.print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                 iter_count = 0
                 time_now = time.time()
+                wandb.log({
+                    "train_loss_iters": train_loss[-1],
+                },
+                step=iterations)
 
             if args.use_amp:
                 scaler.scale(loss).backward()
@@ -236,6 +272,8 @@ for ii in range(args.itr):
             if args.lradj == 'TST':
                 adjust_learning_rate(accelerator, model_optim, scheduler, epoch + 1, args, printout=False)
                 scheduler.step()
+
+            
 
         accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
         train_loss = np.average(train_loss)
@@ -263,6 +301,41 @@ for ii in range(args.itr):
         else:
             accelerator.print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
+
+        model.eval()
+        true_values_list = []
+        predicted_values_list = []
+
+        with torch.no_grad():
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in test_loader:
+                batch_x = batch_x.float().to(accelerator.device)
+                batch_y = batch_y.float().to(accelerator.device)
+                batch_x_mark = batch_x_mark.float().to(accelerator.device)
+                batch_y_mark = batch_y_mark.float().to(accelerator.device)
+
+                dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(accelerator.device)
+                dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(accelerator.device)
+
+                outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if args.output_attention else model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                f_dim = -1 if args.features == 'MS' else 0
+                predicted_values = outputs[:, -args.pred_len:, f_dim:].cpu().numpy().flatten()
+                true_values = batch_y[:, -args.pred_len:, f_dim:].cpu().numpy().flatten()
+
+                true_values_list.extend(true_values)
+                predicted_values_list.extend(predicted_values)
+
+        # Plot true vs predicted values and log to wandb
+        plot_path = f'/home/user/time-llm/Time-LLM/plots/epoch_{epoch + 1}_pred_vs_true.png'
+        plot_predictions_vs_true(true_values, predicted_values, epoch, plot_path)
+        wandb.log({"Prediction vs True Plot": wandb.Image(plot_path)})
+
+        wandb.log({
+            "train_loss": train_loss,
+            "vali_loss": vali_loss,
+            "test_loss": test_loss,
+            "test_mae_loss": test_mae_loss,
+            "epoch": epoch + 1
+        })
 accelerator.wait_for_everyone()
 if accelerator.is_local_main_process:
     path = './checkpoints'  # unique checkpoint saving path

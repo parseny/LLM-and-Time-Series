@@ -1,0 +1,4 @@
+__pycache__
+.env
+wandb
+time-series-dataset.zip
